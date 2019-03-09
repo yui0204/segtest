@@ -8,6 +8,8 @@ from keras.layers import merge, MaxPooling2D, UpSampling2D, core
 from keras.applications.vgg16 import VGG16
 
 
+
+
 def FCN32(n_classes, input_height=256, input_width=512, nChannels=3):
     inputs = Input((input_height, input_width, nChannels))
     vgg16 = VGG16(include_top=False, weights='imagenet', input_tensor=inputs)

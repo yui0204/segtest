@@ -23,6 +23,16 @@ from keras.callbacks import ModelCheckpoint, EarlyStopping, TensorBoard
 from keras.utils import plot_model
 
 import tensorflow as tf
+from keras.utils import multi_gpu_model
+
+config = tf.ConfigProto()
+config.gpu_options.allow_growth = True
+config.gpu_options.visible_device_list = "0"
+sess = tf.Session(config=config)
+K.set_session(sess)
+
+import shutil
+
 
 #from unet import UNet
 import FCN32, FCN8, Segnet, Deeplab, PSPNet, Unet
@@ -68,18 +78,6 @@ def to_final_layer(Y, classes=20):
     Y2 = Y2.astype(np.float32)
     
     return Y2
-
-
-def dice_coef(y_true, y_pred):
-    y_true = K.flatten(y_true)
-    y_pred = K.flatten(y_pred)
-    intersection = K.sum(y_true * y_pred)
-    
-    return 2.0 * intersection / (K.sum(y_true) + K.sum(y_pred) + 1)
-
-
-def dice_coef_loss(y_true, y_pred):
-    return 1.0 - dice_coef(y_true, y_pred)
 
 
 def custom_loss(y_true, y_pred):
@@ -154,44 +152,46 @@ def read_model(Model):
         model = PSPNet.build_pspnet(nb_classes=classes, resnet_layers=101, 
                                     input_shape=(256,512), activation='softmax')
         
-    return model
-
-
-def train_unet(root_dir, X_train, Y_train, Model):
-    model = read_model(Model)
-    if classes == 2:
-        loss = "binary_crossentropy"
-        #loss = dice_coef_loss
-    elif classes > 2:
-        loss = "categorical_crossentropy"
-    print("Loss function is " + loss + "\n")
-    
-    for i in range(100, 0, -10):
-        if os.path.exists(results_dir + "/checkpoint/" + model_name
-                          + "_" + str(i) + ".hdf5"):        
-            model.load_weights(results_dir + "/checkpoint/" + model_name
-                          + "_" + str(i) + ".hdf5")
-            print(results_dir + "checkpoint/" + model_name
-                          + "_" + str(i) + ".hdf5 was loaded")
-            break
         
-    #model.compile(loss=custom_loss, optimizer=Adam(lr=0.0001), metrics=["accuracy"])
-    model.compile(loss=loss, optimizer=Adam(lr=0.0001),metrics=["accuracy"])
+    if gpu_count > 1:
+        multi_model = multi_gpu_model(model, gpus=gpu_count)
+    else:
+        multi_model = model
+        
+    return model, multi_model
+
+
+def train(root_dir, X_train, Y_train, Model):
+    model, multi_model = read_model(Model)
+    loss = "categorical_crossentropy"
+    print("Loss function is " + loss + "\n")
+           
+    if gpu_count == 1:
+        #model.compile(loss=custom_loss, optimizer=Adam(lr=0.0001), metrics=["accuracy"])
+        model.compile(loss=loss, optimizer=Adam(lr=0.001),metrics=["accuracy"])
+    else:
+        multi_model.compile(loss=loss, optimizer=Adam(lr=0.001),metrics=["accuracy"])
     
-    #plot_model(model, to_file = results_dir + model_name + '.png')
+    plot_model(model, to_file = results_dir + model_name + '.png')
     
     early_stopping = EarlyStopping(monitor="val_loss", patience=10, verbose=1)
     checkpoint = ModelCheckpoint(filepath=results_dir + "/checkpoint/" + model_name + "_{epoch}.hdf5",
-                                 save_best_only=False, period=10)
+                                 save_best_only=False, period=100)
     
     tensorboard = TensorBoard(log_dir=results_dir, histogram_freq=0, 
                               write_graph=True)
     
-    #model.summary()
-    history = model.fit(X_train, Y_train, batch_size=BATCH_SIZE, 
-                        epochs=NUM_EPOCH, verbose=1, 
-                        validation_split=0.2,
-                        callbacks=[checkpoint, early_stopping, tensorboard])
+    model.summary()
+    if gpu_count == 1:         
+        history = model.fit(X_train, Y_train, batch_size=BATCH_SIZE, 
+                            epochs=NUM_EPOCH, verbose=1, 
+                            validation_split=0.2,
+                            callbacks=[checkpoint, early_stopping, tensorboard])
+    else:
+        history = multi_model.fit(X_train, Y_train, batch_size=BATCH_SIZE, 
+                            epochs=NUM_EPOCH, verbose=1, 
+                            validation_split=0.2,
+                            callbacks=[checkpoint, early_stopping, tensorboard])
     
     with open(results_dir + "history.pickle", mode="wb") as f:
         pickle.dump(history.history, f)
@@ -201,7 +201,6 @@ def train_unet(root_dir, X_train, Y_train, Model):
         f.write(model_json)
     
     model.save_weights(results_dir + model_name + '_weights.hdf5')
-    model.save_weights(model_name + '_weights.hdf5')
     
     return history
 
@@ -227,19 +226,14 @@ def plot_history(history, model_name):
 
 
 def predict(X_test, Model):
-    model = read_model(Model)
-    model.load_weights(model_name + '_weights.hdf5')
+    model, multi_model = read_model(Model)
+    model.load_weights(results_dir + model_name + '_weights.hdf5')
     
     print("predicting...")
     Y_pred = model.predict(X_test, BATCH_SIZE)
     
-    if classes == 2:
-            Y_pred[Y_pred < 0.5] = 0
-            Y_pred[Y_pred >= 0.5] = 1
-    
-    elif classes > 2:
-        Y_pred = np.argmax(Y_pred, axis=3)
-        Y_pred = Y_pred[:, :, :, np.newaxis]
+    Y_pred = np.argmax(Y_pred, axis=3)
+    Y_pred = Y_pred[:, :, :, np.newaxis]
         
     Y_pred = Y_pred.astype(np.float32)
     print("prediction finished\n")
@@ -254,8 +248,8 @@ def imshow(Y_gt, Y_color):
                     + filenames[i][:len(filenames[i])-19] + "gt.png")
         plt.show()
         plt.imshow(y / 255)#.reshape(256, 512))
-        #plt.savefig(results_dir + "prediction/"
-        #            + filenames[i][:len(filenames[i])-19] + "pred.png")
+        plt.savefig(results_dir + "prediction/"
+                    + filenames[i][:len(filenames[i])-19] + "pred.png")
         plt.show()
         
         
@@ -296,32 +290,37 @@ def calculate_iou(classes, label, pred):
 
 
 
+
+
 if __name__ == '__main__':
     if os.getcwd() == '/home/yui-sudo/document/segmentation/segtest':
         root_dir = "/home/yui-sudo/document/dataset/cityspaces_dataset/"
+        gpu_count = 1
         BATCH_SIZE = 1
-        NUM_EPOCH = 10
-        n_class = [20]
-        load_number = 10
+        NUM_EPOCH = 5
+        load_number = 9
+        mode = "2019_0309"
         plot = True
     else:
         root_dir = "/export2/sudou/cityspaces_dataset/"             # labserver
+        gpu_count = 3
         BATCH_SIZE = 8
         NUM_EPOCH = 100
-        n_class = [20]
         load_number = 3000
+        mode = "train"
         plot = False
     IMAGE_SIZE = 256                                     # original:1024 * 2048
 
-    Model = "Unet" #FCN32, FCN8, etc.
+    Model = "FCN32" #FCN32, FCN8, etc.
+    lr = 0.01
     
-    for i in n_class:
-        classes = i #1 or 20
-        model_name = Model + "_" + str(classes) + "_class"
+    classes = 20
+    model_name = Model + "_" + str(classes) + "_class"
 
-        print("Dataset directory is", root_dir)
-        print("Model name is", model_name, "\n")
-        
+    print("Dataset directory is", root_dir)
+    print("Model name is", model_name, "\n")
+    
+    if mode == "train":
         today = datetime.datetime.today().strftime("%Y_%m%d")
         results_dir = "./model_results/" + today + "/" + model_name + "/"
         
@@ -331,58 +330,64 @@ if __name__ == '__main__':
             os.makedirs(results_dir + "checkpoint/")
             print(results_dir, "was newly made")
           
-        """
+        
         # load train data
         X_train, filenames = load(root_dir + "leftImg8bit/train/", mode="image",
                                   load_number=load_number)
         Y_train, filenames = load(root_dir + "gtFine/train/", mode="gt", 
                                   load_number=load_number)
         Y_train = to_train_id(Y_train)
-        if classes == 1:
-            Y_train = extract_class(Y_train, n=14)
-        elif classes == 20:
-            Y_train = to_final_layer(Y_train, classes=20)
-        else:
-            print("something wrong!")
+        Y_train = to_final_layer(Y_train, classes=20)
+        
+        np.save(root_dir+"X_train.npy", X_train)
+        np.save(root_dir+"Y_train.npy", Y_train)
+    
+        #X_train = np.load(root_dir+"X_train.npy")
+        #Y_train = np.load(root_dir+"Y_train.npy")
         
         print("X", X_train.shape)
         print("Y", Y_train.shape)
         
         # train   
-        history = train_unet(root_dir, X_train, Y_train, Model)
-        """
-        
-        # prediction
-        X_test, filenames = load(root_dir + "leftImg8bit/val/", mode="image")
-        Y_pred = predict(X_test, Model)
-        
-        Y_test, filenames = load(root_dir + "gtFine/val/", mode="gt")
-        Y_test = to_train_id(Y_test)        
-  
-        if plot == True:
-            if classes > 1:
-                Y_color = Y_to_color(Y_pred)
-                Y_gt = Y_to_color(Y_test)
-           
-            else:
-                Y_color = Y_pred * (0, 0, 142)
-                Y_gt = (Y_test == 14) * (0, 0, 142)
-            plot_history(history, model_name)
-            imshow(Y_gt[:10], Y_color[:10])
-            save_image(Y_color[:10])
+        history = train(root_dir, X_train, Y_train, Model)
+    
+    
+    elif not mode == "train":
+        date = mode
+        results_dir = "./model_results/" + date + "/" + model_name + "/"
+        print("Prediction mode using", date, model_name, "\n")
             
-        if classes == 1:    
-            Y_test = extract_class(Y_test, n=14.0)
-                
-        # evaluation
-        cmat, acc, IoU = calculate_iou(classes=i, label=Y_test, pred=Y_pred)
-        print("IoU =", IoU)
-
-        #del cmat, acc, IoU
-        #gc.collect()        
-        #csv_data = np.loadtxt("D:\\170825QCT\\wav\\170825QCT.csv", delimiter=",")
-        #X = pd.DataFrame()
+    # prediction
+    X_test, filenames = load(root_dir + "leftImg8bit/val/", mode="image")
+    Y_pred = predict(X_test, Model)
+    
+    Y_test, filenames = load(root_dir + "gtFine/val/", mode="gt")
+    Y_test = to_train_id(Y_test)        
+  
+    if plot == True:
+        Y_color = Y_pred * (0, 0, 142)
+        Y_gt = (Y_test == 14) * (0, 0, 142)
+        plot_history(history, model_name)
+        imshow(Y_gt[:10], Y_color[:10])
+        save_image(Y_color[:10])
         
+            
+    # evaluation
+    cmat, acc, IoU = calculate_iou(classes=classes, label=Y_test, pred=Y_pred)
+    print("IoU =", IoU)
+
+    #del cmat, acc, IoU
+    #gc.collect()        
+    #csv_data = np.loadtxt("D:\\170825QCT\\wav\\170825QCT.csv", delimiter=",")
+    #X = pd.DataFrame()
+    
 #        with open(results_dir + "log.txt", mode="w") as f:
 #            f.write(model_name)
-        
+    
+    if not os.getcwd() == '/home/yui-sudo/document/segmentation/sound_segtest':
+        shutil.copy("main.py", results_dir)
+        shutil.copy("Unet.py", results_dir)
+        shutil.copy("PSPNet.py", results_dir)
+        shutil.copy("Deeplab.py", results_dir)
+        shutil.move("nohup.out", results_dir)
+    
